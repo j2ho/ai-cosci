@@ -3,6 +3,7 @@
 import json
 import os
 from typing import Any, Optional
+from dataclasses import dataclass
 from src.agent.openrouter_client import OpenRouterClient
 from src.agent.anthropic_client import AnthropicClient
 from src.tools.implementations import (
@@ -12,6 +13,15 @@ from src.tools.implementations import (
     read_file,
     get_tool_definitions,
 )
+
+
+@dataclass
+class AgentPersona:
+    """Represents a scientific agent's persona for role-playing in Virtual Lab."""
+    title: str
+    expertise: str
+    goal: str
+    role: str
 
 
 class BioinformaticsAgent:
@@ -452,3 +462,63 @@ def create_agent(api_key: Optional[str] = None, model: Optional[str] = None, pro
             model = "anthropic/claude-sonnet-4"
 
     return BioinformaticsAgent(api_key=api_key, model=model, provider=provider)
+
+
+class ScientificAgent(BioinformaticsAgent):
+    """A persona-based agent for Virtual Lab architecture.
+
+    Extends BioinformaticsAgent with dynamic role-playing capabilities,
+    allowing the agent to take on specific scientific roles (e.g., PI,
+    Immunologist, Computational Biologist, Critic) in a team meeting setting.
+    """
+
+    def __init__(
+        self,
+        persona: AgentPersona,
+        api_key: Optional[str] = None,
+        model: str = "claude-sonnet-4-20250514",
+        provider: str = "anthropic"
+    ):
+        """Initialize a scientific agent with a specific persona.
+
+        Args:
+            persona: AgentPersona defining the agent's role, expertise, and goals
+            api_key: API key (Anthropic or OpenRouter)
+            model: Model to use
+            provider: 'anthropic' or 'openrouter'
+        """
+        super().__init__(api_key, model, provider)
+        self.persona = persona
+
+    def get_system_prompt(self) -> str:
+        """Get dynamic system prompt based on the agent's persona.
+
+        Returns:
+            System prompt string tailored to this agent's role
+        """
+        return f"""You are {self.persona.title}.
+
+**Expertise:** {self.persona.expertise}
+**Goal:** {self.persona.goal}
+**Role:** {self.persona.role}
+
+You are participating in a Virtual Lab research meeting with other scientific experts.
+Each participant brings specialized knowledge to solve complex biomedical problems.
+
+## Your Responsibilities
+- Apply your specific expertise to analyze the problem from your unique perspective
+- Use available tools (Python, PubMed search, database queries) when needed for your analysis
+- Contribute concise, scientifically rigorous insights
+- Build on and reference other team members' contributions when relevant
+- Acknowledge limitations outside your expertise area
+- Be precise and avoid speculation beyond your domain
+
+## Communication Style
+- Be direct and scientific in your communication
+- Structure your contributions clearly
+- Use appropriate technical terminology for your field
+- Cite evidence and data when making claims
+- Propose actionable next steps when appropriate
+
+Remember: You are ONE expert on a team. Your goal is to contribute your specialized
+knowledge to the collective scientific effort, not to solve everything alone."""
