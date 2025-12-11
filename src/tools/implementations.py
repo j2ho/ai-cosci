@@ -10,6 +10,19 @@ import sys
 from io import StringIO
 import signal
 from contextlib import contextmanager
+import os
+
+# CRITICAL: Set environment variables at module level BEFORE any PaperQA imports
+# LiteLLM reads these at import time, not runtime!
+from dotenv import load_dotenv
+load_dotenv()  # Load .env file to get OPENROUTER_KEY
+
+# Ensure OPENROUTER_KEY is available for PaperQA/LiteLLM
+# Note: LiteLLM expects OPENROUTER_KEY (not OPENROUTER_API_KEY) based on constants.py
+if not os.getenv("OPENROUTER_KEY"):
+    print("WARNING: OPENROUTER_KEY not set - PaperQA will fail", file=sys.stderr)
+else:
+    print(f"✓ OPENROUTER_KEY loaded: {os.getenv('OPENROUTER_KEY')[:15]}...", file=sys.stderr)
 
 
 class ToolResult:
@@ -646,32 +659,45 @@ def search_literature(
         from src.config import get_global_config
         config = get_global_config()
 
-        # Check for required API key based on provider and ensure it's in os.environ for LiteLLM
+        # IMPORTANT: Check embedding config format
+        # PaperQA v5.x expects "st-model-name" for SentenceTransformer models
+        # NOT "sentence-transformers/model-name"
+        embedding_config = config.paperqa_embedding
+        
+        # Determine if using local embeddings based on "st-" prefix
+        using_local_embeddings = embedding_config.startswith("st-")
+
+        # CRITICAL FIX: Explicitly set API keys in os.environ for LiteLLM
+        # LiteLLM checks os.environ at runtime, not just at import
+        # For OpenRouter models, LiteLLM uses OpenAI client with custom base_url
+        # The OpenAI client looks for OPENAI_API_KEY, so we must set it!
         if config.paperqa_llm.startswith("openrouter/"):
-            api_key = os.getenv("OPENROUTER_API_KEY")
+            api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
             if not api_key:
                 return ToolResult(
                     False,
                     None,
                     "OPENROUTER_API_KEY not found. Set it in .env file or environment."
                 )
-            # Explicitly set in os.environ for LiteLLM to find
+            # Set all API key variants for maximum compatibility
             os.environ["OPENROUTER_API_KEY"] = api_key
-            
-            # TRICK: For embeddings via OpenRouter, we use openai/ prefix models but point to OpenRouter
-            # This bypasses LiteLLM's "Unmapped LLM provider" error for openrouter embeddings
-            # We configure OpenAI provider to use OpenRouter's base URL and API key
-            if config.paperqa_embedding.startswith("openai/"):
-                os.environ["OPENAI_API_KEY"] = api_key
-                os.environ["OPENAI_API_BASE"] = "https://openrouter.ai/api/v1"
-                
-        elif config.paperqa_llm.startswith("openai:") or config.paperqa_embedding.startswith("text-embedding"):
-            if not os.getenv("OPENAI_API_KEY"):
+            os.environ["OPENROUTER_KEY"] = api_key
+            # CRITICAL: For openrouter/ models, LiteLLM uses OpenAI client internally
+            # which expects OPENAI_API_KEY to be set!
+            os.environ["OPENAI_API_KEY"] = api_key
+            print(f"[DEBUG] Set API keys in os.environ (OPENROUTER_API_KEY, OPENAI_API_KEY): {api_key[:15]}...", file=sys.stderr)
+
+        # For non-local embeddings, also need the API key
+        if not using_local_embeddings and embedding_config.startswith("openrouter/"):
+            api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_KEY")
+            if not api_key:
                 return ToolResult(
                     False,
                     None,
-                    "OPENAI_API_KEY not found. Set it in .env file or environment."
+                    "OPENROUTER_API_KEY needed for OpenRouter embeddings. Use local embeddings (st-model-name) to avoid API calls."
                 )
+            os.environ["OPENROUTER_API_KEY"] = api_key
+            os.environ["OPENROUTER_KEY"] = api_key
 
         # Use provided paper_dir or fall back to config
         if paper_dir is None:
@@ -699,28 +725,44 @@ def search_literature(
         else:
             actual_mode = mode
 
-        # Initialize PaperQA settings
-        # For local embeddings, check if it's a sentence-transformers model
-        embedding_config = config.paperqa_embedding
+        # embedding_config was already set earlier (before API key checks)
+        # No need to process it again here
 
-        # Check if using local embedding (no provider prefix)
-        is_local_embedding = not any(
-            embedding_config.startswith(prefix)
-            for prefix in ["openrouter/", "openai:", "text-embedding"]
-        )
+        # Debug: Print what we're actually using
+        print(f"[DEBUG] PaperQA LLM: {config.paperqa_llm}", file=sys.stderr)
+        print(f"[DEBUG] PaperQA Embedding: {embedding_config}", file=sys.stderr)
+        print(f"[DEBUG] Using local embeddings: {using_local_embeddings}", file=sys.stderr)
 
-        if is_local_embedding:
-            # For local embeddings with paper-qa[local], use the model name as-is
-            # but ensure it's in the correct format
-            if not embedding_config.startswith("sentence-transformers/"):
-                # Remove 'st-' prefix if present and add proper prefix
-                model_name = embedding_config.replace("st-", "", 1)
-                embedding_config = model_name  # PaperQA[local] handles the prefix
+        # For local embeddings, verify sentence-transformers is installed
+        if using_local_embeddings:
+            try:
+                import sentence_transformers
+                print(f"[DEBUG] sentence-transformers version: {sentence_transformers.__version__}", file=sys.stderr)
+            except ImportError:
+                return ToolResult(
+                    False,
+                    None,
+                    "Local embeddings require sentence-transformers. Install with: pip install sentence-transformers"
+                )
 
-        # Create settings with reduced token usage for free models
+        # Create settings - LiteLLM will automatically use OPENROUTER_KEY from environment
+        # CRITICAL: Disable LLM usage during PDF parsing to avoid API calls
+        # The LLM will ONLY be used during the query phase (docs.query())
+        from paperqa.settings import ParsingSettings
+
         settings_kwargs = {
             "llm": config.paperqa_llm,
+            "summary_llm": config.paperqa_llm,  # Use same LLM for summaries
             "embedding": embedding_config,
+            # DISABLE ALL LLM USAGE DURING PDF PARSING
+            # This ensures NO API calls when loading PDFs
+            "parsing": ParsingSettings(
+                use_doc_details=False,  # Don't use LLM to extract document details
+                chunk_size=3000,  # Standard chunk size
+                overlap=100,  # Standard overlap
+                multimodal=False,  # CRITICAL: Disable image/figure processing (requires LLM)
+                enrichment_llm=config.paperqa_llm,  # Use same LLM for enrichment (vision tasks)
+            )
         }
 
         # Reduce token usage if using free model
@@ -736,6 +778,7 @@ def search_literature(
             )
 
         settings = Settings(**settings_kwargs)
+        print(f"[DEBUG] Parsing config: use_doc_details={settings.parsing.use_doc_details} (LLM disabled during PDF loading)", file=sys.stderr)
 
         # Create document collection
         docs = Docs()
@@ -745,29 +788,72 @@ def search_literature(
 
         # STAGE 1: Try local papers first (if mode allows)
         if actual_mode in ["local", "hybrid", "local_first"]:
+            import time
             pdf_count = 0
             pdf_errors = []
             for pdf_file in paper_dir_path.glob("**/*.pdf"):
-                try:
-                    docs.add(str(pdf_file), settings=settings)
-                    pdf_count += 1
-                except Exception as e:
-                    # Track errors but continue
-                    pdf_errors.append(f"{pdf_file.name}: {str(e)[:100]}")
+                # Retry with exponential backoff for rate limit errors
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        print(f"[DEBUG] Loading PDF: {pdf_file.name}...", file=sys.stderr)
+                        # Provide a basic citation to SKIP LLM call during PDF loading
+                        # The citation can be simple - the LLM will only be used during query
+                        simple_citation = f"{pdf_file.stem}, Local PDF"
+                        docs.add(str(pdf_file), citation=simple_citation, settings=settings)
+                        pdf_count += 1
+                        print(f"[DEBUG] Successfully loaded {pdf_file.name} (no LLM call)", file=sys.stderr)
+                        break  # Success, move to next PDF
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        # Detailed error logging
+                        print(f"[DEBUG] Error loading {pdf_file.name}: {str(e)}", file=sys.stderr)
+                        import traceback
+                        traceback.print_exc()
+
+                        # Check if it's a rate limit error
+                        if "rate" in error_str or "429" in error_str:
+                            if attempt < max_retries - 1:
+                                # Exponential backoff: 2, 4, 8 seconds
+                                wait_time = 2 ** (attempt + 1)
+                                print(f"[DEBUG] Rate limit hit, retrying in {wait_time}s...", file=sys.stderr)
+                                time.sleep(wait_time)
+                                continue  # Retry
+                        # Non-rate-limit error or final retry failed
+                        # Include more error details for diagnosis
+                        error_msg = str(e)
+                        if "api_key" in error_str:
+                            error_msg = f"API key error: {error_msg}"
+                        pdf_errors.append(f"{pdf_file.name}: {error_msg}")
+                        break  # Don't retry non-rate-limit errors
 
             sources_used.append(f"local_library ({pdf_count} PDFs)")
 
             # Report errors if any PDFs failed to load
             if pdf_errors and pdf_count == 0:
+                error_details = '\n'.join(pdf_errors[:3])
+                diagnosis = "\n\nDiagnosis:\n"
+                if any("api_key" in e.lower() for e in pdf_errors):
+                    diagnosis += "- API key not found by LiteLLM during PDF processing\n"
+                    diagnosis += f"- OPENROUTER_API_KEY in env: {bool(os.getenv('OPENROUTER_API_KEY'))}\n"
+                    diagnosis += f"- OPENROUTER_KEY in env: {bool(os.getenv('OPENROUTER_KEY'))}\n"
+                    diagnosis += f"- Using local embeddings: {using_local_embeddings}\n"
+                    if using_local_embeddings:
+                        diagnosis += "- Local embeddings should NOT require API key\n"
+                        diagnosis += "- This suggests PaperQA is making unexpected API calls\n"
+                        diagnosis += "- Try: pip install --upgrade paper-qa sentence-transformers\n"
+
                 return ToolResult(
                     False,
                     None,
-                    f"Failed to load any PDFs from {paper_dir}. Errors: {'; '.join(pdf_errors[:3])}"
+                    f"Failed to load any PDFs from {paper_dir}.\n\nErrors:\n{error_details}{diagnosis}"
                 )
             
             # Query local papers first
             if pdf_count > 0:
                 try:
+                    print(f"[DEBUG] Querying with LLM: {settings.llm}", file=sys.stderr)
+                    print(f"[DEBUG] Querying with embedding: {settings.embedding}", file=sys.stderr)
                     local_answer = docs.query(question, settings=settings)
                     
                     # Check if local answer is sufficient (has contexts and not "I cannot answer")

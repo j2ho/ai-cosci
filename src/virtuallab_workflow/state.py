@@ -55,6 +55,16 @@ class ResearchState(TypedDict):
     references: list[str]
     """List of references (PMIDs, data sources)"""
     
+    # Consensus mechanism (optional)
+    requires_consensus: Optional[bool]
+    """Whether to use multi-model consensus (default: False)"""
+    
+    consensus_models: Optional[list[str]]
+    """List of models to use for consensus"""
+    
+    consensus_metadata: Optional[dict]
+    """Metadata from consensus: agreement_score, key_agreements, key_disagreements"""
+    
     # Metadata
     execution_path: list[str]
     """Track which nodes were executed"""

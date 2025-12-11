@@ -13,6 +13,7 @@ from src.virtuallab_workflow.nodes import (
     human_review_node,
     should_continue_after_review
 )
+from src.virtuallab_workflow.nodes_consensus import virtual_lab_consensus_node
 
 
 def create_research_workflow(enable_human_review: bool = False) -> StateGraph:
@@ -260,4 +261,115 @@ def continue_after_human_review(
         return {
             "final_answer": f"Error continuing workflow: {str(e)}",
             "errors": [str(e)]
+        }
+
+
+def create_consensus_workflow() -> StateGraph:
+    """Create a workflow that uses the consensus node."""
+    workflow = StateGraph(ResearchState)
+    
+    # Add nodes
+    workflow.add_node("classifier", classify_question_node)
+    workflow.add_node("consensus_lab", virtual_lab_consensus_node)
+    
+    # Set entry point
+    workflow.set_entry_point("classifier")
+    
+    # Simple linear flow for this test: Classifier -> Consensus -> End
+    # (In a full version, we might route to different consensus configurations)
+    workflow.add_edge("classifier", "consensus_lab")
+    workflow.add_edge("consensus_lab", END)
+    
+    return workflow.compile(checkpointer=MemorySaver())
+
+
+def run_consensus_workflow(
+    question: str,
+    team_size: int = 3,
+    num_rounds: int = 2,
+    thread_id: str = "default",
+    verbose: bool = True
+) -> dict:
+    """Run a research question through the Consensus LangGraph workflow.
+    
+    Args:
+        question: Research question to answer
+        team_size: Number of specialists per meeting
+        num_rounds: Number of discussion rounds
+        thread_id: Unique thread ID for state persistence
+        verbose: Print execution details
+        
+    Returns:
+        Final state dictionary with answer and metadata
+    """
+    # Create workflow
+    app = create_consensus_workflow()
+    
+    # Initial state
+    initial_state: ResearchState = {
+        "question": question,
+        "team_size": team_size,
+        "num_rounds": num_rounds,
+        "question_type": "",
+        "question_complexity": "",
+        "team_composition": [],
+        "meeting_transcript": "",
+        "requires_human_approval": False,
+        "human_feedback": None,
+        "approval_status": "approved",
+        "final_answer": "",
+        "confidence_score": 0.0,
+        "references": [],
+        "execution_path": [],
+        "errors": []
+    }
+    
+    # Configure thread for state persistence
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    if verbose:
+        print(f"\n{'='*80}")
+        print(f"Research Question: {question}")
+        print(f"Mode: Consensus (Combined)")
+        print(f"Thread ID: {thread_id}")
+        print(f"{'='*80}\n")
+    
+    # Execute workflow
+    try:
+        # Stream execution
+        for event in app.stream(initial_state, config):
+            if verbose:
+                for node_name, node_output in event.items():
+                    print(f"\n--- Node: {node_name} ---")
+                    if "execution_path" in node_output:
+                        print(f"Execution Path: {' -> '.join(node_output['execution_path'])}")
+                    if "question_type" in node_output:
+                        print(f"Question Type: {node_output['question_type']}")
+                    if "meeting_transcript" in node_output:
+                        print("Consensus Meeting Complete")
+                        print(f"Agreement Score: {node_output.get('confidence_score', 'N/A')}")
+        
+        # Get final state
+        final_state = app.get_state(config)
+        
+        if verbose:
+            print(f"\n{'='*80}")
+            print("WORKFLOW COMPLETE")
+            print(f"{'='*80}")
+            print(f"Execution Path: {' -> '.join(final_state.values.get('execution_path', []))}")
+            print(f"\nFinal Answer:\n{final_state.values.get('final_answer', 'No answer generated')}")
+            print(f"\nConfidence: {final_state.values.get('confidence_score', 0.0):.2f}")
+            print(f"{'='*80}\n")
+        
+        return final_state.values
+        
+    except Exception as e:
+        if verbose:
+            print(f"\n❌ Workflow execution error: {str(e)}")
+        return {
+            "question": question,
+            "final_answer": f"Error executing workflow: {str(e)}",
+            "confidence_score": 0.0,
+            "errors": [str(e)],
+            "execution_path": ["error"]
         }

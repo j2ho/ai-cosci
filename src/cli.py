@@ -13,6 +13,7 @@ load_dotenv()
 
 from src.agent.agent import create_agent
 from src.agent.meeting import run_virtual_lab
+from src.virtuallab_workflow.workflow import run_consensus_workflow, run_research_workflow
 
 
 def save_answer_to_file(answer: str, question: str, output_path: str = None, mode: str = "single") -> str:
@@ -142,6 +143,16 @@ Examples:
         help="Enable Virtual Lab mode (multi-agent collaboration)",
     )
     parser.add_argument(
+        "--combined",
+        action="store_true",
+        help="Enable Combined Mode (LangGraph + Consensus)",
+    )
+    parser.add_argument(
+        "--langgraph",
+        action="store_true",
+        help="Enable LangGraph workflow (without consensus)",
+    )
+    parser.add_argument(
         "--rounds",
         "-r",
         type=int,
@@ -216,7 +227,58 @@ Examples:
 
     if args.question:
         # Single question mode
-        if args.virtual_lab:
+        if args.combined:
+            # Combined Mode (LangGraph + Consensus)
+            print("\n" + "=" * 60)
+            print("COMBINED MODE (LangGraph + Consensus)")
+            print("=" * 60)
+            print(f"Question: {args.question}")
+            print("=" * 60)
+
+            result = run_consensus_workflow(
+                question=args.question,
+                team_size=args.team_size,
+                num_rounds=args.rounds,
+                thread_id=f"cli_combined_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                verbose=args.verbose
+            )
+            
+            final_answer = result.get("final_answer", "No answer generated")
+            
+            print("\n" + "=" * 60)
+            print("FINAL ANSWER:")
+            print("=" * 60)
+            print(final_answer)
+            
+            output_file = save_answer_to_file(final_answer, args.question, args.output, mode="combined")
+            print(f"\n✓ Answer saved to: {output_file}")
+
+        elif args.langgraph:
+            # LangGraph Mode (Standard)
+            print("\n" + "=" * 60)
+            print("LANGGRAPH MODE")
+            print("=" * 60)
+            print(f"Question: {args.question}")
+            print("=" * 60)
+
+            result = run_research_workflow(
+                question=args.question,
+                enable_human_review=False,
+                thread_id=f"cli_langgraph_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                verbose=args.verbose
+            )
+            
+            final_answer = result.get("final_answer", "No answer generated")
+            
+            print("\n" + "=" * 60)
+            print("FINAL ANSWER:")
+            print("=" * 60)
+            print(final_answer)
+            
+            output_file = save_answer_to_file(final_answer, args.question, args.output, mode="langgraph")
+            print(f"\n✓ Answer saved to: {output_file}")
+
+        elif args.virtual_lab:
             # Virtual Lab mode - multi-agent collaboration
             print("\n" + "=" * 60)
             print("VIRTUAL LAB MODE")
