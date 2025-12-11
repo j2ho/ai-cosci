@@ -2,6 +2,7 @@
 
 import json
 import os
+import asyncio
 from typing import Any, Optional
 from dataclasses import dataclass
 from src.agent.openrouter_client import OpenRouterClient
@@ -12,6 +13,7 @@ from src.tools.implementations import (
     search_literature,
     query_database,
     read_file,
+    find_files,
     get_tool_definitions,
 )
 
@@ -66,6 +68,7 @@ class BioinformaticsAgent:
             "search_literature": search_literature,
             "query_database": query_database,
             "read_file": read_file,
+            "find_files": find_files,
         }
         self.conversation_history = []
         self.max_iterations = 30  # Increased from 10 to allow complex multi-step analyses
@@ -159,6 +162,9 @@ Remember: Your goal is to help scientists make informed decisions, not to provid
             # Add input_dir to read_file calls
             elif tool_name == "read_file":
                 tool_input["input_dir"] = self.input_dir
+            # Add data_dir to find_files calls
+            elif tool_name == "find_files":
+                tool_input["data_dir"] = self.data_dir
             result = tool_func(**tool_input)
             return result.to_dict()
         except TypeError as e:
@@ -311,6 +317,20 @@ Remember: Your goal is to help scientists make informed decisions, not to provid
                 return msg["content"]
 
         return ""
+
+    async def run_async(self, user_question: str, verbose: bool = False) -> str:
+        """Async version of run() for parallel specialist execution.
+
+        Args:
+            user_question: The question to answer
+            verbose: Print intermediate steps
+
+        Returns:
+            Final response from the agent
+        """
+        # Run the synchronous version in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self.run, user_question, verbose)
 
     def get_critic_prompt(self) -> str:
         """Get the system prompt for the scientific critic.

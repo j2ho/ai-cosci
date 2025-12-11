@@ -136,6 +136,8 @@ def search_pubmed(query: str, max_results: int = 10, retmax: int = 100) -> ToolR
     Returns:
         ToolResult with list of articles
     """
+    import xml.etree.ElementTree as ET
+    
     try:
         # NCBI E-utilities endpoints
         search_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
@@ -158,34 +160,72 @@ def search_pubmed(query: str, max_results: int = 10, retmax: int = 100) -> ToolR
         if not pmids:
             return ToolResult(True, [])
 
-        # Fetch article details using esummary (which properly supports JSON)
-        summary_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        # Fetch full article details using efetch (includes abstracts)
+        fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
         fetch_params = {
             "db": "pubmed",
             "id": ",".join(pmids),
-            "retmode": "json",
+            "retmode": "xml",
+            "rettype": "abstract",
         }
 
-        fetch_response = requests.get(summary_url, params=fetch_params, timeout=10)
+        fetch_response = requests.get(fetch_url, params=fetch_params, timeout=15)
         fetch_response.raise_for_status()
-        fetch_data = fetch_response.json()
+        
+        # Parse XML response
+        root = ET.fromstring(fetch_response.content)
 
         articles = []
-        for pmid in pmids:
-            if pmid in fetch_data.get("result", {}):
-                doc = fetch_data["result"][pmid]
-                # Extract authors
-                authors = []
-                if "authors" in doc:
-                    authors = [author.get("name", "") for author in doc["authors"][:3]]
+        for article in root.findall(".//PubmedArticle"):
+            # Extract PMID
+            pmid_elem = article.find(".//PMID")
+            pmid = pmid_elem.text if pmid_elem is not None else "N/A"
+            
+            # Extract title
+            title_elem = article.find(".//ArticleTitle")
+            title = title_elem.text if title_elem is not None else "N/A"
+            
+            # Extract abstract (combine all AbstractText elements)
+            abstract_parts = []
+            for abstract_text in article.findall(".//AbstractText"):
+                # Check for labeled sections (e.g., BACKGROUND, METHODS)
+                label = abstract_text.get("Label", "")
+                text = abstract_text.text or ""
+                if label:
+                    abstract_parts.append(f"{label}: {text}")
+                else:
+                    abstract_parts.append(text)
+            abstract = " ".join(abstract_parts) if abstract_parts else "N/A"
+            
+            # Extract authors (first 3)
+            authors = []
+            for author in article.findall(".//Author")[:3]:
+                last_name = author.find(".//LastName")
+                initials = author.find(".//Initials")
+                if last_name is not None:
+                    author_name = last_name.text
+                    if initials is not None:
+                        author_name += f" {initials.text}"
+                    authors.append(author_name)
+            
+            # Extract publication date
+            pub_date = article.find(".//PubDate")
+            date_str = "N/A"
+            if pub_date is not None:
+                year = pub_date.find("Year")
+                month = pub_date.find("Month")
+                if year is not None:
+                    date_str = year.text
+                    if month is not None:
+                        date_str = f"{year.text} {month.text}"
 
-                articles.append({
-                    "pmid": pmid,
-                    "title": doc.get("title", "N/A"),
-                    "abstract": doc.get("abstract", "N/A"),  # Note: esummary may not always include full abstract
-                    "authors": authors,
-                    "pubdate": doc.get("pubdate", "N/A"),
-                })
+            articles.append({
+                "pmid": pmid,
+                "title": title,
+                "abstract": abstract,
+                "authors": authors,
+                "pubdate": date_str,
+            })
 
         return ToolResult(True, articles)
 
@@ -482,6 +522,79 @@ def read_file(file_path: str, input_dir: str = "./data") -> ToolResult:
         return ToolResult(False, None, f"File read error: {str(e)}")
 
 
+def find_files(
+    pattern: Optional[str] = None,
+    category: Optional[str] = None,
+    extension: Optional[str] = None,
+    name_contains: Optional[str] = None,
+    question_context: Optional[str] = None,
+    workspace_root: str = ".",
+    data_dir: Optional[str] = None
+) -> ToolResult:
+    """Intelligently find relevant files in workspace without repeated directory traversal.
+    
+    This tool maintains an index of workspace files for efficient discovery.
+    Much faster than multiple execute_python + os.listdir() calls.
+    
+    Args:
+        pattern: Glob pattern to match (e.g., '**/Q5/*.csv', '**/*exhaustion*.csv')
+        category: Filter by type: 'data', 'config', 'script', 'doc'
+        extension: File extension (e.g., 'csv', '.csv', 'parquet')
+        name_contains: Find files with this in the name (case-insensitive)
+        question_context: Research question - will score files by relevance
+        workspace_root: Workspace root directory (default: current directory)
+        data_dir: Separate data directory to index (e.g., /path/to/Competition_Data)
+        
+    Returns:
+        ToolResult with list of file paths and metadata
+        
+    Examples:
+        find_files(extension='csv', question_context='T-cell exhaustion')
+        find_files(pattern='**/Q5/*.csv')
+        find_files(category='data', name_contains='DEG')
+    """
+    try:
+        from src.utils.file_index import get_file_index
+        
+        # Get or create file index
+        index = get_file_index(workspace_root, data_dir)
+        
+        if question_context:
+            # Smart search based on question
+            file_metadata = index.get_data_files(question_context=question_context)
+        else:
+            # Manual search by criteria
+            file_metadata = index.find_files(
+                pattern=pattern,
+                category=category,
+                extension=extension,
+                name_contains=name_contains
+            )
+        
+        # Format results for readability
+        results = []
+        for meta in file_metadata:
+            results.append({
+                "path": meta.path,
+                "name": meta.name,
+                "type": f"{meta.category}/{meta.subcategory}" if meta.subcategory else meta.category,
+                "size_mb": round(meta.size_bytes / (1024 * 1024), 2)
+            })
+            
+        summary = {
+            "total_files": len(results),
+            "files": results[:50]  # Limit to top 50 to avoid overwhelming output
+        }
+        
+        if len(results) > 50:
+            summary["note"] = f"Showing top 50 of {len(results)} files. Refine search if needed."
+            
+        return ToolResult(True, summary)
+        
+    except Exception as e:
+        return ToolResult(False, None, f"File search error: {str(e)}")
+
+
 def search_literature(
     question: str,
     mode: str = "auto",
@@ -491,14 +604,25 @@ def search_literature(
     """Advanced literature search using PaperQA with local PDFs and/or internet search.
 
     This tool provides deep literature analysis by:
-    - Searching local PDF library (if available)
-    - Searching online databases (PubMed, arXiv) for new papers
+    - **PRIORITIZING** local PDF library (if available) 
+    - Searching online databases (PubMed, arXiv) only if local papers insufficient
     - Reading full-text papers (not just abstracts)
     - Generating cited, evidence-based answers
 
+    Search Strategy (mode='auto', RECOMMENDED):
+    1. First queries local PDF library
+    2. If local papers provide good answer → returns immediately (faster, more focused)
+    3. If local papers insufficient → supplements with online search
+    
+    This ensures your curated local papers are always checked first!
+
     Args:
         question: Research question to answer (natural language)
-        mode: Search mode - 'local' (only PDFs), 'online' (only internet), 'auto' (both)
+        mode: Search mode:
+            - 'auto' (default): Prioritize local, supplement with online if needed
+            - 'local': Only local PDFs
+            - 'online': Skip local, only internet search
+            - 'hybrid': Search both simultaneously (no prioritization)
         paper_dir: Directory containing local PDF papers (uses config default if None)
         max_sources: Maximum number of source contexts to retrieve (default: 5)
 
@@ -567,9 +691,9 @@ def search_literature(
             )
 
         if mode == "auto":
-            # Auto mode: use local if available, otherwise online
+            # Auto mode: prioritize local, supplement with online if needed
             if has_local_papers:
-                actual_mode = "hybrid"  # Both local and online
+                actual_mode = "local_first"  # Try local first, then add online if needed
             else:
                 actual_mode = "online"
         else:
@@ -617,9 +741,10 @@ def search_literature(
         docs = Docs()
 
         sources_used = []
+        local_answer = None
 
-        # Add local papers if requested
-        if actual_mode in ["local", "hybrid"]:
+        # STAGE 1: Try local papers first (if mode allows)
+        if actual_mode in ["local", "hybrid", "local_first"]:
             pdf_count = 0
             pdf_errors = []
             for pdf_file in paper_dir_path.glob("**/*.pdf"):
@@ -639,9 +764,45 @@ def search_literature(
                     None,
                     f"Failed to load any PDFs from {paper_dir}. Errors: {'; '.join(pdf_errors[:3])}"
                 )
+            
+            # Query local papers first
+            if pdf_count > 0:
+                try:
+                    local_answer = docs.query(question, settings=settings)
+                    
+                    # Check if local answer is sufficient (has contexts and not "I cannot answer")
+                    has_good_local_answer = (
+                        local_answer 
+                        and local_answer.contexts 
+                        and len(local_answer.contexts) > 0
+                        and "cannot answer" not in local_answer.answer.lower()
+                    )
+                    
+                    # If local_first mode and we have a good answer, return it without online search
+                    if actual_mode == "local_first" and has_good_local_answer:
+                        contexts = [
+                            {
+                                "text": ctx.context,
+                                "citation": ctx.text.name if hasattr(ctx.text, 'name') else "Unknown",
+                                "score": ctx.score if hasattr(ctx, 'score') else None
+                            }
+                            for ctx in local_answer.contexts
+                        ]
+                        
+                        return ToolResult(True, {
+                            "answer": local_answer.answer,
+                            "contexts": contexts,
+                            "references": local_answer.references if hasattr(local_answer, 'references') else [],
+                            "sources_used": sources_used + ["(local papers sufficient - skipped online search)"],
+                            "mode": "local"
+                        })
+                        
+                except Exception as e:
+                    # If local query fails, continue to online
+                    sources_used.append(f"(local query error: {str(e)[:50]})")
 
-        # Add online search if requested
-        if actual_mode in ["online", "hybrid"]:
+        # STAGE 2: Add online search if needed
+        if actual_mode in ["online", "hybrid", "local_first"]:
             import requests
             import urllib.parse
             import tempfile
@@ -924,8 +1085,42 @@ def get_tool_definitions() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "find_files",
+                "description": "Intelligently find relevant files in the workspace without repeated directory traversal. Much more efficient than using execute_python with os.listdir(). Can search by pattern, file type, or question relevance. Use this FIRST before trying to read files - it will help you discover what data is available.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Optional glob pattern to match (e.g., '**/Q5/*.csv', '**/*exhaustion*.csv')",
+                        },
+                        "category": {
+                            "type": "string",
+                            "description": "Optional filter by file category: 'data', 'config', 'script', 'doc'",
+                            "enum": ["data", "config", "script", "doc"],
+                        },
+                        "extension": {
+                            "type": "string",
+                            "description": "Optional file extension filter (e.g., 'csv', 'parquet', 'bam')",
+                        },
+                        "name_contains": {
+                            "type": "string",
+                            "description": "Optional: find files with this substring in the name (case-insensitive)",
+                        },
+                        "question_context": {
+                            "type": "string",
+                            "description": "Optional: research question text - will intelligently score and rank files by relevance to the question",
+                        },
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "search_literature",
-                "description": "Advanced AI-powered literature search using PaperQA. Searches local PDF library and/or online databases (PubMed, arXiv), reads full-text papers, and generates evidence-based answers with citations. More rigorous than search_pubmed - use this when you need detailed, cited information from research papers.",
+                "description": "Advanced AI-powered literature search using PaperQA. PRIORITIZES local PDF library first, then supplements with online databases (PubMed, arXiv) if needed. Reads full-text papers and generates evidence-based answers with citations. More rigorous than search_pubmed - use this when you need detailed, cited information from research papers. Default 'auto' mode checks local PDFs first and only searches online if local papers don't provide a good answer.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -935,8 +1130,8 @@ def get_tool_definitions() -> list[dict[str, Any]]:
                         },
                         "mode": {
                             "type": "string",
-                            "description": "Search mode: 'local' (only local PDFs), 'online' (only internet search), 'auto' (use both if available, default)",
-                            "enum": ["local", "online", "auto"],
+                            "description": "Search mode: 'local' (only local PDFs), 'online' (skip local, only internet), 'auto' (prioritize local, supplement with online if needed - RECOMMENDED), 'hybrid' (search both simultaneously)",
+                            "enum": ["local", "online", "auto", "hybrid"],
                             "default": "auto",
                         },
                         "paper_dir": {

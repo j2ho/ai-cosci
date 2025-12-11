@@ -1,7 +1,8 @@
 """Virtual Lab meeting structure for multi-agent collaboration."""
 
 import os
-from typing import Optional
+import asyncio
+from typing import Optional, List, Dict
 from src.agent.agent import ScientificAgent, AgentPersona
 from src.agent.team_manager import (
     create_research_team,
@@ -109,6 +110,47 @@ class VirtualLabMeeting:
 
         self.meeting_transcript = []
 
+    def _run_specialists_parallel(self) -> List[str]:
+        """Run all specialists in parallel for efficiency.
+        
+        Returns:
+            List of specialist responses in the same order as self.specialists
+        """
+        # Build context that all specialists will see
+        context = self._build_context(last_n=5)
+        
+        specialist_prompt = f"""Research Question: "{self.user_question}"
+
+Meeting Context (recent discussion):
+{context}
+
+Contribute your specialized analysis. You may:
+- Use tools (find_files, read_file, execute_python, search_pubmed, search_literature, query_database) as needed
+- Build on others' findings
+- Propose specific analyses or experiments
+- Point out issues you see
+- **CITE SOURCES**: When using tools or literature, cite the source (PMID for papers, filename for data, database name for queries)
+
+Be concise (3-5 sentences or a specific analysis). Focus on YOUR expertise."""
+
+        async def run_all():
+            """Run all specialists concurrently."""
+            tasks = [
+                agent.run_async(specialist_prompt, verbose=self.verbose)
+                for agent in self.specialists
+            ]
+            return await asyncio.gather(*tasks)
+        
+        # Run the async function
+        if asyncio.get_event_loop().is_running():
+            # If we're already in an async context, create new task
+            loop = asyncio.get_event_loop()
+            future = asyncio.run_coroutine_threadsafe(run_all(), loop)
+            return future.result()
+        else:
+            # Otherwise, use asyncio.run()
+            return asyncio.run(run_all())
+
     def run_meeting(self, num_rounds: int = 2) -> str:
         """Run the Virtual Lab meeting.
 
@@ -155,29 +197,15 @@ Keep it concise - this is just the opening."""
                 print(f"[PHASE 2: DISCUSSION ROUND {round_num + 1}/{num_rounds}]")
                 print(f"{'=' * 60}")
 
-            # Each specialist contributes
-            for agent in self.specialists:
+            # Run specialists in PARALLEL for efficiency
+            specialist_responses = self._run_specialists_parallel()
+            
+            # Add responses to transcript
+            for agent, response in zip(self.specialists, specialist_responses):
                 if self.verbose:
-                    print(f"\n--- {agent.persona.title} speaking ---")
-
-                # Build context from recent transcript
-                context = self._build_context(last_n=5)
-
-                specialist_prompt = f"""Research Question: "{self.user_question}"
-
-Meeting Context (recent discussion):
-{context}
-
-Contribute your specialized analysis. You may:
-- Use tools (execute_python, search_pubmed, query_database, search_literature, read_file) as needed
-- Build on others' findings
-- Propose specific analyses or experiments
-- Point out issues you see
-- **CITE SOURCES**: When using tools or literature, cite the source (PMID for papers, filename for data, database name for queries)
-
-Be concise (3-5 sentences or a specific analysis). Focus on YOUR expertise."""
-
-                response = agent.run(specialist_prompt, verbose=self.verbose)
+                    print(f"\n--- {agent.persona.title} ---")
+                    print(f"{response[:300]}..." if len(response) > 300 else response)
+                
                 self.meeting_transcript.append({
                     "speaker": agent.persona.title,
                     "role": agent.persona.role,
